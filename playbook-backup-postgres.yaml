@@ -1,0 +1,270 @@
+---
+- name: PostgreSQL Backup and Upload to Azure Blob
+  hosts: all
+  become: yes
+  vars:
+    # PostgreSQL connection details
+    pg_host: "{{ PG_HOST }}"
+    pg_user: "{{ PG_USER }}"
+    pg_password: "{{ PG_PASSWORD }}"
+
+    # Backup configuration
+    base_backup_dir: "{{ BASE_BACKUP_DIR }}"
+    exclude_db: "{{ EXCLUDE_DB }}"
+    all_dbs: true
+    specific_db_list: ["database1", "database2", "database3", "history"]
+
+    # Set the current date and time for folder naming (calculated once)
+    current_date: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"
+    backup_folder_name: "railtel-hyd-PGSQL-Backup-{{ current_date }}"
+    full_backup_path: "{{ base_backup_dir }}/{{ backup_folder_name }}"
+    backup_archive_name: "{{ backup_folder_name }}.tar.gz"
+
+    # Email configuration
+    smtp_server: "{{ SMTP_SERVER }}"
+    smtp_port: "{{ SMTP_PORT }}"
+    smtp_username: "{{ SMTP_USERNAME }}"
+    smtp_password: "{{ SMTP_PASSWORD }}"
+    email_sender: "{{ EMAIL_SENDER }}"
+    email_recipients: "{{ EMAIL_RECIPIENTS }}"
+     # Google Drive upload details
+    upload_script_path: "/data/postgresdb/upload.py"  # Path to the Python upload script on the remote machine
+
+  tasks:
+    - block:
+        - name: Ensure /data directory exists
+          file:
+            path: "{{ base_backup_dir }}"
+            state: directory
+
+        - name: Ensure backup folder exists
+          file:
+            path: "{{ full_backup_path }}"
+            state: directory
+
+        - name: Get the list of databases to back up
+          shell: |
+            psql -h {{ pg_host }} -U {{ pg_user }} -d postgres -t -c "SELECT datname FROM pg_database WHERE datname NOT IN ({{ exclude_db }});"
+          register: db_list_output
+          environment:
+            PGPASSWORD: "{{ pg_password }}"
+          changed_when: false
+
+        - name: Set database list
+          set_fact:
+            db_list: "{{ db_list_output.stdout_lines | map('trim') | join(' ') }}"
+          when: all_dbs
+
+        - name: Use specific database list if not all databases
+          set_fact:
+            db_list: "{{ specific_db_list | join(' ') }}"
+          when: not all_dbs
+
+        - name: Back up each database to individual SQL files
+          shell: |
+            pg_dump -h {{ pg_host }} -U {{ pg_user }} -d {{ item }} --clean > "{{ full_backup_path }}/{{ item }}.sql"
+          loop: "{{ db_list.split() }}"
+          environment:
+            PGPASSWORD: "{{ pg_password }}"
+          register: backup_results
+          ignore_errors: yes
+
+        - name: Collect failed databases
+          set_fact:
+            failed_dbs: "{{ backup_results.results | selectattr('failed', 'equalto', true) | map(attribute='item') | list }}"
+
+        - name: Retry failed database backups
+          when: backup_results.results | selectattr('failed', 'equalto', true) | length > 0
+          block:
+            - name: Retry backup for each failed database
+              shell: |
+                pg_dump -h {{ pg_host }} -U {{ pg_user }} -d {{ item }} --clean > "{{ full_backup_path }}/{{ item }}.sql"
+              loop: "{{ backup_results.results | selectattr('failed', 'equalto', true) | map(attribute='item') | list }}"
+              environment:
+                PGPASSWORD: "{{ pg_password }}"
+              retries: 3
+              delay: 5
+              ignore_errors: yes
+              
+        - name: Calculate the size of individual files in the backup folder
+          shell: |
+            find "{{ base_backup_dir }}/{{ backup_folder_name }}" -type f -exec du -h {} + > "{{ base_backup_dir }}/{{ backup_folder_name }}-size.txt"
+          register: backup_size
+          changed_when: false
+
+        - name: Check if the backup size file exists and is not empty
+          stat:
+            path: "{{ base_backup_dir }}/{{ backup_folder_name }}-size.txt"
+          register: size_file_stat
+
+        - name: Read the backup sizes into a variable
+          slurp:
+            src: "{{ base_backup_dir }}/{{ backup_folder_name }}-size.txt"
+          register: slurped_size_file
+          when: size_file_stat.stat.exists and size_file_stat.stat.size > 0
+
+        - name: Set database sizes for notification
+          set_fact:
+            db_size_list: "{{ slurped_size_file['content'] | b64decode | split('\n') }}"
+          when: slurped_size_file is defined and slurped_size_file['content'] is not none
+
+        - name: Prepare email body content
+          set_fact:
+            email_body: >-
+              <h2 style='color:green;'>Job SUCCESS</h2>
+              <p>Job Type: Backup</p>
+              <p>Database Sizes:</p>
+              <table border='1' style='width:100%;'>
+                <tr>
+                  <th>Database Name</th>
+                  <th>Size</th>
+                </tr>
+                {% if db_size_list is defined and db_size_list | length > 0 %}
+                {% for line in db_size_list %}
+                  {% if line %}
+                  <tr>
+                    <td>{{ line.split('/')[-1].split('.')[0] }}</td>
+                    <td>{{ line.split()[0] }}</td>
+                  </tr>
+                  {% endif %}
+                {% endfor %}
+                {% else %}
+                <tr>
+                  <td colspan="2">No backups were created.</td>
+                </tr>
+                {% endif %}
+              </table>
+          when: db_size_list is defined
+
+        - name: Debug email body
+          debug:
+            msg: "Email body content: {{ email_body }}"
+
+
+        - name: Compress the backup directory
+          shell: |
+            tar -czvf "{{ base_backup_dir }}/{{ backup_archive_name }}" -C "{{ base_backup_dir }}" "{{ backup_folder_name }}"
+
+        # # Upload compressed backup to Azure Blob Storage
+        # - name: Upload compressed backup to Azure Blob Storage
+        #   shell: |
+        #     azcopy copy "{{ base_backup_dir }}/{{ backup_archive_name }}" "{{ az_blob_url }}?{{ az_blob_token }}" --from-to LocalBlob
+        #   when: az_blob_url is defined and az_blob_token is defined
+
+        # # Upload backup size text file to Azure Blob Storage
+        # - name: Upload backup size text file to Azure Blob Storage
+        #   shell: |
+        #     azcopy copy "{{ base_backup_dir }}/{{ backup_folder_name }}-size.txt" "{{ az_blob_url }}?{{ az_blob_token }}" --from-to LocalBlob
+        #   when: az_blob_url is defined and az_blob_token is defined
+
+        - name: Check if upload.py exists on the remote server
+          stat:
+            path: "{{ upload_script_path }}"
+          register: upload_script
+    
+        - name: Fail if upload.py is not found on the remote server
+          fail:
+            msg: "upload.py script is missing on the remote server!"
+          when: not upload_script.stat.exists
+        
+        - name: Upload backup to Google Drive
+          #shell: "python3 /data/postgresdb/upload.py {{ base_backup_dir }}/{{ backup_folder }}.tar.gz"
+          shell: "python3 /data/postgresdb/upload.py {{ base_backup_dir }}/{{ backup_archive_name }}"
+          register: upload_output
+          ignore_errors: yes  # Continue even if the script fails
+    
+        - name: Show Google Drive upload result
+          debug:
+            var: upload_output.stdout
+    
+        - name: Fail the playbook if the upload to Google Drive failed
+          fail:
+            msg: "Google Drive upload failed!"
+          when: upload_output is failed or (upload_output.stdout is search("error"))
+
+        - name: Remove uncompressed backup folder after upload
+          file:
+            path: "{{ full_backup_path }}"
+            state: absent
+          ignore_errors: yes
+
+        - name: Remove compressed backup file after upload
+          file:
+            path: "{{ base_backup_dir }}/{{ backup_archive_name }}"
+            state: absent
+          ignore_errors: yes
+
+        - name: Remove backup size text file after upload
+          file:
+            path: "{{ base_backup_dir }}/{{ backup_folder_name }}-size.txt"
+            state: absent
+          ignore_errors: yes
+
+      rescue:              
+        - name: Create Python script to send failure email
+          copy:
+            content: |
+              import smtplib
+              from email.mime.multipart import MIMEMultipart
+              from email.mime.text import MIMEText
+
+              def send_email(subject, body, recipients):
+                  msg = MIMEMultipart()
+                  msg['From'] = "{{ email_sender }}"
+                  msg['To'] = ', '.join(recipients.split(','))
+                  msg['Subject'] = subject
+                  msg.attach(MIMEText(body, 'html'))
+                  try:
+                      server = smtplib.SMTP("{{ smtp_server }}", {{ smtp_port }})
+                      server.starttls()
+                      server.login("{{ smtp_username }}", "{{ smtp_password }}")
+                      server.sendmail("{{ email_sender }}", recipients.split(','), msg.as_string())
+                      server.quit()
+                  except Exception as e:
+                      print(f"Failed to send email: {str(e)}")
+
+              send_email(
+                  subject='railtel-hydPostgreSQL Backup Job (Backup) - FAILED',
+                  body='<h2 style="color:red;">Job FAILED</h2><p>Job Type: Backup</p><p>Error: Playbook failed at task: {{ ansible_failed_task.name }} with error: {{ ansible_failed_result.msg[:1000] }}</p>',
+                  recipients="{{ email_recipients }}"
+              )
+            dest: /tmp/send_failure_email.py
+
+        - name: Send failure email notification
+          command: python3 /tmp/send_failure_email.py
+          ignore_errors: yes
+
+      always:
+        - name: Create Python script to send success email
+          copy:
+            content: |
+              import smtplib
+              from email.mime.multipart import MIMEMultipart
+              from email.mime.text import MIMEText
+      
+              def send_email(subject, body, recipients):
+                  msg = MIMEMultipart()
+                  msg['From'] = "{{ email_sender }}"
+                  msg['To'] = ', '.join(recipients.split(','))
+                  msg['Subject'] = subject
+                  msg.attach(MIMEText(body, 'html'))
+                  try:
+                      server = smtplib.SMTP("{{ smtp_server }}", {{ smtp_port }})
+                      server.starttls()
+                      server.login("{{ smtp_username }}", "{{ smtp_password }}")
+                      server.sendmail("{{ email_sender }}", recipients.split(','), msg.as_string())
+                      server.quit()
+                  except Exception as e:
+                      print(f"Failed to send email: {str(e)}")
+      
+              send_email(
+                  subject='railtel-hydPostgreSQL Backup Job (Backup) - SUCCESS',
+                  body="""{{ email_body }}""",
+                  recipients="{{ email_recipients }}"
+              )
+            dest: /tmp/send_success_email.py
+
+        - name: Send success email notification
+          command: python3 /tmp/send_success_email.py
+          when: ansible_failed_result is not defined
+          ignore_errors: yes

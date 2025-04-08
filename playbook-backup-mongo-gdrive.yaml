@@ -1,0 +1,87 @@
+---
+- name: Backup MongoDB databases and upload to Google Drive
+  hosts: all
+  become: yes
+  vars:
+    # MongoDB connection details
+    mongodb_host: "percona-mongodb-db-ps-rs0.percona.svc.cluster.local"
+    mongodb_port: 27017
+    replicaset: "rs0"
+    mongodb_user: "gaian"
+    mongodb_auth_db: "admin"
+    mongodb_password: "GaianMobius"
+
+    # Backup configuration
+    base_backup_dir: "/root/mongodb1"  # Local directory to store backups temporarily
+    exclude_dbs: "admin local config"
+
+    # Define the backup folder globally to be used in multiple tasks
+    backup_folder: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}-ctrls-mongo-backup"
+
+    # Google Drive upload details
+    upload_script_path: "/root/upload.py"  # Path to the Python upload script on the remote machine
+
+  tasks:
+    - name: Ensure backup directory exists locally
+      file:
+        path: "{{ base_backup_dir }}"
+        state: directory
+
+    - name: Fetch all databases from MongoDB
+      shell: |
+        mongo "mongodb://{{ mongodb_user }}:{{ mongodb_password }}@{{ mongodb_host }}:{{ mongodb_port }}/?authSource={{ mongodb_auth_db }}&replicaSet={{ replicaset }}&readPreference=primary&retryWrites=true&ssl=false" --quiet --eval 'db.adminCommand({ listDatabases: 1 }).databases.map(db => db.name).join(" ")'
+      register: db_list
+      changed_when: false
+
+    - name: Filter out excluded databases
+      set_fact:
+        databases_to_backup: "{{ db_list.stdout.split() | difference(exclude_dbs.split()) }}"
+
+    - name: Debug database list
+      debug:
+        msg: "Databases to backup: {{ databases_to_backup }}"
+
+    - name: Backup each database
+      shell: |
+        mongodump --uri "mongodb://{{ mongodb_user }}:{{ mongodb_password }}@{{ mongodb_host }}:{{ mongodb_port }}/?authSource={{ mongodb_auth_db }}&replicaSet={{ replicaset }}&readPreference=primary&retryWrites=true&ssl=false" --db {{ item }} --out "{{ base_backup_dir }}/{{ backup_folder }}"
+      loop: "{{ databases_to_backup }}"
+      loop_control:
+        loop_var: item
+
+    - name: Compress the backup directory
+      shell: |
+        tar -czvf "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz" -C "{{ base_backup_dir }}" "{{ backup_folder }}"
+      args:
+        chdir: "{{ base_backup_dir }}"
+
+    - name: Check if upload.py exists on the remote server
+      stat:
+        path: "{{ upload_script_path }}"
+      register: upload_script
+
+    - name: Fail if upload.py is not found on the remote server
+      fail:
+        msg: "upload.py script is missing on the remote server!"
+      when: not upload_script.stat.exists
+
+    - name: Upload backup to Google Drive
+      script: "{{ upload_script_path }}"
+      args:
+        remote_src: true
+      register: upload_output
+      ignore_errors: yes  # This ensures playbook continues even if script fails
+
+    - name: Show Google Drive upload result
+      debug:
+        var: upload_output.stdout
+
+    - name: Fail the playbook if the upload to Google Drive failed
+      fail:
+        msg: "Google Drive upload failed!"
+      when: upload_output is failed or (upload_output.stdout is search("error"))
+
+    - name: Remove local backup file after upload
+      file:
+        path: "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz"
+        state: absent
+      ignore_errors: yes

@@ -1,0 +1,87 @@
+---
+- name: Restore TiDB Backup from Azure Blob Storage
+  hosts: all
+  become: yes
+  vars:
+    # TiDB connection details
+    tidb_host: "basic-tidb.tidb-cluster.svc.cluster.local"
+    tidb_port: 4000
+    tidb_user: "root"
+    tidb_password: "GaianMobius"
+
+    # Backup configuration
+    base_backup_dir: "/data/tidb_backup"  # Local directory to store backups temporarily
+    backup_file_name: "railtel-tidb-backup--2024-10-08-16-02.tar.gz"  # Specific backup file name to download
+
+  tasks:
+    - name: Ensure backup directory exists locally
+      file:
+        path: "{{ base_backup_dir }}"
+        state: directory
+
+    - name: Download the specific backup file from Azure Blob Storage
+      shell: |
+        azcopy copy "{{ az_blob_url }}/{{ backup_file_name }}?{{ az_blob_token }}" "{{ base_backup_dir }}/{{ backup_file_name }}"
+      args:
+        creates: "{{ base_backup_dir }}/{{ backup_file_name }}"
+
+    - name: Extract the compressed backup directly into the base directory
+      shell: |
+        tar --strip-components=1 -xzvf "{{ base_backup_dir }}/{{ backup_file_name }}" -C "{{ base_backup_dir }}"
+      register: extract_result
+      changed_when: True
+
+    - name: Find all SQL files in the extracted backup directory
+      find:
+        paths: "{{ base_backup_dir }}"
+        patterns: "*.sql"
+      register: sql_files
+
+    - name: List all found SQL files
+      debug:
+        msg: "{{ sql_files.files | map(attribute='path') | list }}"
+
+    - name: Check if databases exist and create if not
+      block:
+        - name: Check if database exists
+          shell: |
+            mysql -u {{ tidb_user }} -p{{ tidb_password }} -P {{ tidb_port }} -h {{ tidb_host }} -e "SHOW DATABASES LIKE '{{ item.path | basename | splitext | first }}';"
+          register: db_exists
+          changed_when: false
+          failed_when: false
+          loop: "{{ sql_files.files }}"
+          loop_control:
+            loop_var: item
+
+        - name: Debug database existence check output
+          debug:
+            var: db_exists.results
+
+        - name: Create databases that do not exist
+          shell: |
+            mysql -u {{ tidb_user }} -p{{ tidb_password }} -P {{ tidb_port }} -h {{ tidb_host }} -e "CREATE DATABASE IF NOT EXISTS \`{{ item.item.path | basename | splitext | first }}\`;"
+          when: item.stdout.strip() == ""
+          loop: "{{ db_exists.results }}"
+          loop_control:
+            loop_var: item
+
+    - name: Restore each database from SQL files
+      shell: |
+        mysql -u {{ tidb_user }} -p{{ tidb_password }} -P {{ tidb_port }} -h {{ tidb_host }} "{{ item.path | basename | splitext | first }}" < "{{ item.path }}"
+      loop: "{{ sql_files.files }}"
+      loop_control:
+        loop_var: item
+      register: restore_result
+      retries: 3
+      delay: 5
+      until: restore_result.rc == 0
+
+    - name: Debug restore result
+      debug:
+        var: restore_result
+
+    - name: Remove extracted backup files after restoration
+      file:
+        path: "{{ base_backup_dir }}"
+        state: absent
+      ignore_errors: yes

@@ -1,0 +1,89 @@
+---
+- name: Backup Databases and Upload to Azure Blob
+  hosts: all
+  vars:
+    current_date: "{{ lookup('pipe', 'date +%Y-%m-%d_%H-%M') }}"
+    backup_dir: "/home/dump/{{ current_date }}DB_Backup"
+    azure_blob_sas_url_mongodb: "https://prodmobiusdbbkp.blob.core.windows.net/mongodb?sv=2022-11-02&ss=bfqt&srt=sco&sp=rwdlacupiytfx&se=2043-10-20T01:01:06Z&st=2023-10-19T17:01:06Z&spr=https&sig=3agOLgIiDfK9DFCu%2Fx3WwCBq%2BEExHWExCoOEhA09Dgs="
+    azure_blob_sas_url_postgres: "https://prodmobiusdbbkp.blob.core.windows.net/postgresdb?sv=2022-11-02&ss=bfqt&srt=sco&sp=rwdlacupiytfx&se=2043-10-20T01:01:06Z&st=2023-10-19T17:01:06Z&spr=https&sig=3agOLgIiDfK9DFCu%2Fx3WwCBq%2BEExHWExCoOEhA09Dgs="
+    azure_blob_sas_url_tidb: "https://prodmobiusdbbkp.blob.core.windows.net/mysqlmanaged?sv=2022-11-02&ss=bfqt&srt=sco&sp=rwdlacupiytfx&se=2043-10-20T01:01:06Z&st=2023-10-19T17:01:06Z&spr=https&sig=3agOLgIiDfK9DFCu%2Fx3WwCBq%2BEExHWExCoOEhA09Dgs="
+
+  tasks:
+    - name: Ensure backup directory exists
+      ansible.builtin.file:
+        path: "{{ backup_dir }}"
+        state: directory
+
+    - name: Ensure subdirectories for each database type exist
+      ansible.builtin.file:
+        path: "{{ backup_dir }}/{{ item }}"
+        state: directory
+      loop:
+        - mongo
+        - postgres
+        - tidb
+
+    - name: Dump MongoDB databases excluding non-essential databases
+      shell: |
+        MONGODB_URI="mongodb+srv://gaian:GaianMobius@percona-mongodb-db-ps-rs0.percona.svc.cluster.local/?authSource=admin&maxIdleTimeMS=60000&retryWrites=true&ssl=false"
+        BACKUP_DIR="{{ backup_dir }}/mongo"
+        DATABASES=$(mongo "$MONGODB_URI" --quiet --eval "db.adminCommand({ listDatabases: 1 }).databases.map(db => db.name).filter(db => !['admin', 'local', 'config'].includes(db)).join(' ')")
+        for DB in $DATABASES; do
+          mongodump --uri="$MONGODB_URI" --db="$DB" --out="$BACKUP_DIR/$DB"
+        done
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
+
+    - name: Dump PostgreSQL databases
+      shell: |
+        HOST="cnpg-cluster-rw.cnpg-database.svc.cluster.local"
+        USER="gaian"
+        BASE_BACKUP_DIR="{{ backup_dir }}/postgres"
+        export PGPASSWORD='GaianMobius'
+        EXCLUDE_DB="'postgres','template0','template1'"
+        databases=$(psql -h $HOST -U $USER -d postgres -t -c "SELECT datname FROM pg_database WHERE datname NOT IN ($EXCLUDE_DB);" | xargs)
+        for db in $databases; do
+            pg_dump -h $HOST -U $USER -d $db > "$BASE_BACKUP_DIR/${db}.sql"
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Dump TiDB databases
+      shell: |
+        USER="root"
+        PASSWORD="GaianMobius"
+        HOST="basic-tidb.tidb-cluster.svc.cluster.local"
+        BASE_BACKUP_DIR="{{ backup_dir }}/tidb"
+        databases=$(mysql -u $USER -p$PASSWORD -P 4000 -h $HOST -e "SHOW DATABASES;" | tr -d "| " | grep -v Database)
+        for db in $databases; do
+            if [[ "$db" != "INFORMATION_SCHEMA" ]] && [[ "$db" != "METRICS_SCHEMA" ]] && [[ "$db" != "mysql" ]] && [[ "$db" != "PERFORMANCE_SCHEMA" ]] && [[ "$db" != "test" ]] && [[ "$db" != _* ]] ; then
+                mysqldump -u $USER -p$PASSWORD -P 4000 -h $HOST --databases "$db" > "${BASE_BACKUP_DIR}/${db}.sql"
+            fi
+        done
+      args:
+        executable: /bin/bash
+
+    - name: Compress MongoDB backups
+      shell: tar -czvf "{{ backup_dir }}/{{ current_date }}mongo_backup.tar.gz" -C "{{ backup_dir }}" mongo
+
+    - name: Compress PostgreSQL backups
+      shell: tar -czvf "{{ backup_dir }}/{{ current_date }}psql_backup.tar.gz" -C "{{ backup_dir }}" postgres
+
+    - name: Compress TiDB backups
+      shell: tar -czvf "{{ backup_dir }}/{{ current_date }}tidb_backup.tar.gz" -C "{{ backup_dir }}" tidb
+
+    - name: Upload MongoDB backup to Azure Blob using azcopy
+      ansible.builtin.command:
+        cmd: "sudo azcopy copy '{{ backup_dir }}/{{ current_date }}mongo_backup.tar.gz' '{{ azure_blob_sas_url_mongodb }}' --recursive=true"
+      become: yes
+
+    - name: Upload PostgreSQL backup to Azure Blob using azcopy
+      ansible.builtin.command:
+        cmd: "sudo azcopy copy '{{ backup_dir }}/{{ current_date }}psql_backup.tar.gz' '{{ azure_blob_sas_url_postgres }}' --recursive=true"
+      become: yes
+
+    - name: Upload TiDB backup to Azure Blob using azcopy
+      ansible.builtin.command:
+        cmd: "sudo azcopy copy '{{ backup_dir }}/{{ current_date }}tidb_backup.tar.gz' '{{ azure_blob_sas_url_tidb }}' --recursive=true"
+      become: yes

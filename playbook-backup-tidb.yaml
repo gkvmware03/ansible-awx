@@ -1,0 +1,254 @@
+---
+- name: Backup TiDB databases and upload to Azure Blob Storage
+  hosts: all
+  become: yes
+  vars:
+    # TiDB connection details
+    tidb_host: "{{ TIDB_HOST }}"
+    tidb_port: "{{ TIDB_PORT }}"
+    tidb_user: "{{ TIDB_USER }}"
+    tidb_password: "{{ TIDB_PASSWORD }}"
+
+    # Backup configuration
+    base_backup_dir: "{{ BASE_BACKUP_DIR }}"
+    exclude_dbs: "{{ EXCLUDE_DBS }}"
+    all_dbs: true
+    db_list: "database1 database2 database3"
+
+    # Define the backup folder globally
+    backup_folder: "railtel-hyd-TiDB-Backup--{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"
+
+    # Email configuration
+    smtp_server: "{{ SMTP_SERVER }}"
+    smtp_port: "{{ SMTP_PORT }}"
+    smtp_username: "{{ SMTP_USERNAME }}"
+    smtp_password: "{{ SMTP_PASSWORD }}"
+    email_sender: "{{ EMAIL_SENDER }}"
+    email_recipients: "{{ EMAIL_RECIPIENTS }}"
+
+    # Google Drive upload details
+    upload_script_path: "/data/tidb/upload.py"  # Path to the Python upload script on the remote machine
+
+  tasks:
+    - block:
+        - name: Ensure backup directory exists locally
+          file:
+            path: "{{ base_backup_dir }}"
+            state: directory
+
+        - name: Ensure today's backup directory exists
+          file:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}"
+            state: directory
+
+        - name: Fetch all databases from TiDB if all_dbs is true
+          when: all_dbs
+          shell: |
+            mysql -u {{ tidb_user }} -p{{ tidb_password }} -P {{ tidb_port }} -h {{ tidb_host }} -e "SHOW DATABASES;" | tr -d "| " | grep -v Database
+          register: db_list_result
+          changed_when: false
+
+        - name: Set db_list from the result if all_dbs is true
+          set_fact:
+            db_list: "{{ db_list_result.stdout_lines }}"
+          when: all_dbs
+
+        - name: Filter out excluded databases
+          set_fact:
+            databases_to_backup: "{{ db_list | difference(exclude_dbs.split()) }}"
+
+        - name: Backup each TiDB database
+          shell: |
+            mysqldump -u {{ tidb_user }} -p{{ tidb_password }} -P {{ tidb_port }} -h {{ tidb_host }} --databases "{{ item }}" > "{{ base_backup_dir }}/{{ backup_folder }}/{{ item }}.sql"
+          loop: "{{ databases_to_backup }}"
+          loop_control:
+            loop_var: item
+          register: backup_results
+          ignore_errors: yes
+
+        - name: Collect failed databases
+          set_fact:
+            failed_dbs: "{{ backup_results.results | selectattr('failed', 'equalto', true) | map(attribute='item') | list }}"
+
+        - name: Retry failed database backups
+          when: failed_dbs | length > 0
+          block:
+            - name: Retry backup for each failed TiDB database
+              shell: |
+                mysqldump -u {{ tidb_user }} -p{{ tidb_password }} -P {{ tidb_port }} -h {{ tidb_host }} --databases "{{ item }}" > "{{ base_backup_dir }}/{{ backup_folder }}/{{ item }}.sql"
+              loop: "{{ failed_dbs }}"
+              retries: 3
+              delay: 5
+              register: retry_results
+              until: retry_results is succeeded
+              ignore_errors: yes
+
+        - name: Calculate the size of individual files in the backup folder
+          shell: |
+            find "{{ base_backup_dir }}/{{ backup_folder }}" -type f -exec du -h {} + > "{{ base_backup_dir }}/{{ backup_folder }}-size.txt"
+          register: backup_size
+          changed_when: false
+
+        - name: Check if backup size file exists
+          stat:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}-size.txt"
+          register: slurped_size_file_stat
+        
+        - name: Read the backup sizes into a variable
+          slurp:
+            src: "{{ base_backup_dir }}/{{ backup_folder }}-size.txt"
+          register: slurped_size_file
+          when: slurped_size_file_stat.stat.exists and slurped_size_file_stat.stat.size > 0
+
+        - name: Set database sizes for notification
+          set_fact:
+            db_size_list: "{{ slurped_size_file['content'] | b64decode | split('\n') }}"
+
+        - name: Prepare email body content
+          set_fact:
+            email_body: >-
+              <h2 style='color:green;'>Job SUCCESS</h2>
+              <p>Job Type: Backup</p>
+              <p>Database Sizes:</p>
+              <table border='1' style='width:100%;'>
+                <tr>
+                  <th>Database Name</th>
+                  <th>Size</th>
+                </tr>
+                {% if db_size_list is defined and db_size_list | length > 0 %}
+                {% for line in db_size_list %}
+                  {% if line %}
+                  <tr>
+                    <td>{{ line.split('/')[-1].split('.')[0] }}</td>
+                    <td>{{ line.split()[0] }}</td>
+                  </tr>
+                  {% endif %}
+                {% endfor %}
+                {% else %}
+                <tr>
+                  <td colspan="2">No backups were created.</td>
+                </tr>
+                {% endif %}
+              </table>
+
+        - name: Compress the backup directory
+          shell: |
+            tar -czvf "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz" -C "{{ base_backup_dir }}" "{{ backup_folder }}"
+
+        # # Upload compressed backup to Azure Blob Storage
+        # - name: Upload compressed backup to Azure Blob Storage
+        #   shell: |
+        #     azcopy copy "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz" "{{ az_blob_url }}?{{ az_blob_token }}" --from-to LocalBlob
+
+        # # Upload backup size text file to Azure Blob Storage
+        # - name: Upload backup size text file to Azure Blob Storage
+        #   shell: |
+        #     azcopy copy "{{ base_backup_dir }}/{{ backup_folder }}-size.txt" "{{ az_blob_url }}?{{ az_blob_token }}" --from-to LocalBlob
+
+        - name: Check if upload.py exists on the remote server
+          stat:
+            path: "{{ upload_script_path }}"
+          register: upload_script
+       
+        
+        - name: Upload backup to Google Drive
+          shell: "python3 /data/postgresdb/upload.py {{ base_backup_dir }}/{{ backup_folder }}.tar.gz"
+          register: upload_output
+          ignore_errors: yes  # Continue even if the script fails
+        
+
+        - name: Show Google Drive upload result (stdout)
+          debug:
+            var: upload_output.stdout
+    
+        - name: Fail the playbook if the upload to Google Drive failed
+          fail:
+            msg: "Google Drive upload failed!"
+          when: upload_output is failed or (upload_output.stdout is search("error"))
+
+        - name: Remove uncompressed backup folder after upload
+          file:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}"
+            state: absent
+          ignore_errors: yes
+
+        - name: Remove compressed backup file after upload
+          file:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz"
+            state: absent
+          ignore_errors: yes
+
+        - name: Remove backup size text file after upload
+          file:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}-size.txt"
+            state: absent
+          ignore_errors: yes
+
+      rescue:
+        - name: Create Python script to send failure email
+          copy:
+            content: |
+              import smtplib
+              from email.mime.multipart import MIMEMultipart
+              from email.mime.text import MIMEText
+
+              def send_email(subject, body, recipients):
+                  msg = MIMEMultipart()
+                  msg['From'] = "{{ email_sender }}"
+                  msg['To'] = ", ".join(recipients.split(','))
+                  msg['Subject'] = subject
+                  msg.attach(MIMEText(body, 'html'))
+                  try:
+                      server = smtplib.SMTP("{{ smtp_server }}", {{ smtp_port }})
+                      server.starttls()
+                      server.login("{{ smtp_username }}", "{{ smtp_password }}")
+                      server.sendmail("{{ email_sender }}", recipients.split(','), msg.as_string())
+                      server.quit()
+                  except Exception as e:
+                      print(f"Failed to send email: {str(e)}")
+
+              send_email(
+                  subject='railtel-hydTiDB Backup Job (Backup) - FAILED',
+                  body='<h2 style="color:red;">Job FAILED</h2><p>Job Type: Backup</p><p>Error: Playbook failed at task: {{ ansible_failed_task.name if ansible_failed_task is defined else "Unknown" }} with error: {{ ansible_failed_result.msg[:1000] if ansible_failed_result is defined else "Unknown error" }}</p>',
+                  recipients="{{ email_recipients }}"
+              )
+            dest: /tmp/send_failure_email.py
+
+        - name: Send failure email notification
+          command: python3 /tmp/send_failure_email.py
+          ignore_errors: yes
+
+      always:
+        - name: Create Python script to send success email
+          copy:
+            content: |
+              import smtplib
+              from email.mime.multipart import MIMEMultipart
+              from email.mime.text import MIMEText
+      
+              def send_email(subject, body, recipients):
+                  msg = MIMEMultipart()
+                  msg['From'] = "{{ email_sender }}"
+                  msg['To'] = ', '.join(recipients.split(','))
+                  msg['Subject'] = subject
+                  msg.attach(MIMEText(body, 'html'))
+                  try:
+                      server = smtplib.SMTP("{{ smtp_server }}", {{ smtp_port }})
+                      server.starttls()
+                      server.login("{{ smtp_username }}", "{{ smtp_password }}")
+                      server.sendmail("{{ email_sender }}", recipients.split(','), msg.as_string())
+                      server.quit()
+                  except Exception as e:
+                      print(f"Failed to send email: {str(e)}")
+      
+              send_email(
+                  subject='railtel-hydTiDB Backup Job (Backup) - SUCCESS',
+                  body="""{{ email_body }}""",
+                  recipients="{{ email_recipients }}"
+              )
+            dest: /tmp/send_success_email.py
+
+        - name: Send success email notification
+          command: python3 /tmp/send_success_email.py
+          when: ansible_failed_result is not defined
+          ignore_errors: yes

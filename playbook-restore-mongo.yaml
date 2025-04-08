@@ -1,0 +1,80 @@
+---
+- name: Restore MongoDB Backup from Azure Blob Storage
+  hosts: all
+  become: yes
+  vars:
+    # MongoDB connection details
+    mongodb_host: "percona-mongodb-db-ps-rs0.percona.svc.cluster.local"
+    mongodb_user: "gaian"
+    mongodb_password: "GaianMobius"
+    mongodb_auth_db: "admin"
+    
+    # Backup configuration
+    base_backup_dir: "/root/backup"  # Local directory to store backups temporarily
+    backup_file_name: "railtel-mongo-backup-2024-10-03-06-12.tar.gz"  # Specific backup file name to download
+
+  tasks:
+    - name: Ensure backup directory exists locally
+      file:
+        path: "{{ base_backup_dir }}"
+        state: directory
+
+    - name: Download the specific backup file from Azure Blob Storage
+      shell: |
+        azcopy copy "{{ az_blob_url }}/{{ backup_file_name }}?{{ az_blob_token }}" "{{ base_backup_dir }}/{{ backup_file_name }}"
+      args:
+        creates: "{{ base_backup_dir }}/{{ backup_file_name }}"
+
+    - name: Extract the compressed backup directly into the base directory
+      shell: |
+        tar --strip-components=1 -xzvf "{{ base_backup_dir }}/{{ backup_file_name }}" -C "{{ base_backup_dir }}"
+      register: extract_result
+      changed_when: True
+
+    - name: Find all database directories in the extracted backup directory
+      find:
+        paths: "{{ base_backup_dir }}"
+        file_type: directory
+        recurse: no
+      register: db_directories
+
+    - name: Debug database directories found
+      debug:
+        msg: "Found database directories: {{ db_directories.files | map(attribute='path') | list }}"
+
+    - name: Validate if the directory contains MongoDB dump files
+      find:
+        paths: "{{ item.path }}"
+        recurse: no
+        patterns: "*.bson"
+      register: bson_files
+      loop: "{{ db_directories.files }}"
+      loop_control:
+        loop_var: item
+
+    - name: Restore collections for each database
+      shell: |
+        mongorestore --uri "mongodb://{{ mongodb_user }}:{{ mongodb_password }}@{{ mongodb_host }}/?authSource={{ mongodb_auth_db }}&maxIdleTimeMS=60000&retryWrites=true&ssl=false" --db "{{ item.path | basename }}" --dir "{{ item.path }}" --verbose
+      loop: "{{ db_directories.files }}"
+      loop_control:
+        loop_var: item
+      register: restore_result
+      retries: 3
+      delay: 5
+      until: restore_result.rc == 0
+
+    - name: Debug restore result
+      debug:
+        var: restore_result
+
+    - name: Remove extracted backup files after restoration
+      file:
+        path: "{{ base_backup_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Remove downloaded backup file after restoration
+      file:
+        path: "{{ base_backup_dir }}/{{ backup_file_name }}"
+        state: absent
+      ignore_errors: yes

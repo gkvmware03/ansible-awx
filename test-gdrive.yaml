@@ -1,0 +1,67 @@
+---
+- name: Backup AWX PostgreSQL databases and upload to Google Drive
+  hosts: all
+  become: yes
+  vars:
+    # PostgreSQL connection details
+    postgres_host: "awx-postgres-13.awx1.svc.cluster.local"  # Update with your PostgreSQL service host
+    postgres_port: 5432
+    postgres_user: "awx"  # Update with your PostgreSQL username
+    postgres_db: "awx"    # The database name to backup
+    postgres_password: "GQZwijqzpi2eMNKdABDOJOxnRzA6iiLz"  # Update with your PostgreSQL password
+
+    # Backup configuration
+    base_backup_dir: "/root/postgres_backups"  # Local directory to store backups temporarily
+
+    # Define the backup folder globally to be used in multiple tasks
+    backup_folder: "{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}-awx-postgres-backup"
+
+    # Google Drive upload details
+    upload_script_path: "/root/upload.py"  # Path to the Python upload script on the remote machine
+
+  tasks:
+    - name: Ensure backup directory exists locally
+      file:
+        path: "{{ base_backup_dir }}"
+        state: directory
+
+    - name: Backup PostgreSQL database
+      shell: |
+        PGPASSWORD={{ postgres_password }} pg_dump -h {{ postgres_host }} -p {{ postgres_port }} -U {{ postgres_user }} {{ postgres_db }} > "{{ base_backup_dir }}/{{ backup_folder }}.sql"
+      environment:
+        PGPASSWORD: "{{ postgres_password }}"
+
+    - name: Compress the backup file
+      shell: |
+        tar -czvf "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz" -C "{{ base_backup_dir }}" "{{ backup_folder }}.sql"
+      args:
+        chdir: "{{ base_backup_dir }}"
+
+    - name: Check if upload.py exists on the remote server
+      stat:
+        path: "{{ upload_script_path }}"
+      register: upload_script
+
+    - name: Fail if upload.py is not found on the remote server
+      fail:
+        msg: "upload.py script is missing on the remote server!"
+      when: not upload_script.stat.exists
+
+    - name: Upload backup to Google Drive
+      command: python3 "{{ upload_script_path }}" "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz"
+      register: upload_output
+
+    - name: Show Google Drive upload result
+      debug:
+        var: upload_output.stdout
+
+    - name: Fail the playbook if the upload to Google Drive failed
+      fail:
+        msg: "Google Drive upload failed!"
+      when: upload_output is failed or (upload_output.stdout is search("error"))
+
+    - name: Remove local backup file after upload
+      file:
+        path: "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz"
+        state: absent
+      ignore_errors: yes

@@ -1,0 +1,251 @@
+---
+- name: Backup MongoDB databases and upload to Azure Blob Storage
+  hosts: all
+  become: yes
+  vars:
+    mongodb_host: "{{ MONGODB_HOST }}"
+    mongodb_port: "{{ MONGODB_PORT }}"
+    replicaset: "{{ REPLICASET }}"
+    mongodb_user: "{{ MONGODB_USER }}"
+    mongodb_auth_db: "{{ MONGODB_AUTH_DB }}"
+    mongodb_password: "{{ MONGODB_PASSWORD }}"
+    base_backup_dir: "{{ BASE_BACKUP_DIR }}"
+    exclude_dbs: "{{ EXCLUDE_DBS }}"
+    backup_folder: "railtel-hyd-Mongo-Backup-{{ ansible_date_time.date }}-{{ ansible_date_time.hour }}-{{ ansible_date_time.minute }}"
+    smtp_server: "{{ SMTP_SERVER }}"
+    smtp_port: "{{ SMTP_PORT }}"
+    smtp_username: "{{ SMTP_USERNAME }}"
+    smtp_password: "{{ SMTP_PASSWORD }}"
+    email_sender: "{{ EMAIL_SENDER }}"
+    email_recipients: "{{ EMAIL_RECIPIENTS }}"
+    # Google Drive upload details
+    upload_script_path: "/data/mongodb/upload.py"  # Path to the Python upload script on the remote machine
+
+  tasks:
+    - block:
+        - name: Ensure backup directory exists locally
+          file:
+            path: "{{ base_backup_dir }}"
+            state: directory
+
+        - name: Fetch all databases from MongoDB
+          shell: |
+            mongo "mongodb://{{ mongodb_user }}:{{ mongodb_password }}@{{ mongodb_host }}:{{ mongodb_port }}/?authSource={{ mongodb_auth_db }}&replicaSet={{ replicaset }}&readPreference=primary&retryWrites=true&ssl=false" --quiet --eval 'db.adminCommand({ listDatabases: 1 }).databases.map(db => db.name).join(" ")'
+          register: db_list
+          changed_when: false
+
+        - name: Filter out excluded databases
+          set_fact:
+            databases_to_backup: "{{ db_list.stdout.split() | difference(exclude_dbs.split()) }}"
+
+        - name: Debug database list
+          debug:
+            msg: "Databases to backup: {{ databases_to_backup }}"
+
+        - name: Backup each database
+          shell: |
+            mongodump --uri "mongodb://{{ mongodb_user }}:{{ mongodb_password }}@{{ mongodb_host }}:{{ mongodb_port }}/?authSource={{ mongodb_auth_db }}&replicaSet={{ replicaset }}&readPreference=primary&retryWrites=true&ssl=false" --db {{ item }} --out "{{ base_backup_dir }}/{{ backup_folder }}"
+          loop: "{{ databases_to_backup }}"
+          loop_control:
+            loop_var: item
+
+        - name: Create a tar.gz file of the backup
+          shell: |
+            tar -czvf "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz" -C "{{ base_backup_dir }}" "{{ backup_folder }}"
+          args:
+            chdir: "{{ base_backup_dir }}"
+
+        - name: Get size of individual files and directories inside the backup folder
+          shell: |
+            find "{{ base_backup_dir }}/{{ backup_folder }}" -type f -exec du -h {} + > "{{ base_backup_dir }}/{{ backup_folder }}-size.txt"
+          register: folder_size_output
+
+        - name: Check if size report file exists
+          stat:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}-size.txt"
+          register: size_report_file
+
+        - name: Debug size report file existence
+          debug:
+            msg: "Size report file exists: {{ size_report_file.stat.exists }}"
+
+        - name: Get size of individual databases in MongoDB (Human Readable)
+          shell: |
+            mongo "mongodb://{{ mongodb_user }}:{{ mongodb_password }}@{{ mongodb_host }}:{{ mongodb_port }}/?authSource={{ mongodb_auth_db }}&replicaSet={{ replicaset }}&readPreference=primary&retryWrites=true&ssl=false" --quiet --eval '
+              function humanReadable(size) {
+                if (size < 1024) return size + " B";
+                let units = ["KB", "MB", "GB", "TB"];
+                let i = -1;
+                do {
+                  size = size / 1024;
+                  i++;
+                } while (size >= 1024 && i < units.length - 1);
+                return size.toFixed(2) + " " + units[i];
+              }
+              var excludeDbs = "{{ exclude_dbs }}".split(" ");
+              db.getSiblingDB("admin").runCommand({ listDatabases: 1 }).databases
+                .filter(d => !excludeDbs.includes(d.name))
+                .map(d => `${d.name}: ${humanReadable(d.sizeOnDisk)}`)
+                .join("\n")
+            '
+          register: db_sizes
+
+        - name: Set database sizes for notification
+          set_fact:
+            db_size_list: "{{ db_sizes.stdout_lines }}"
+
+        - name: Check if backup tar.gz file exists
+          stat:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz"
+          register: backup_file
+
+        - name: Debug backup tar.gz file existence
+          debug:
+            msg: "Backup tar.gz file exists: {{ backup_file.stat.exists }}"
+
+        - name: List files to be uploaded
+          shell: ls -lh "{{ base_backup_dir }}"  # List all files in the backup directory
+          register: file_list_before_upload
+
+        - name: Debug file list before upload
+          debug:
+            msg: "Files in backup directory before upload: {{ file_list_before_upload.stdout_lines }}"
+
+        # - name: Upload backup to Azure Blob Storage
+        #   shell: |
+        #     azcopy copy "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz" "{{ az_blob_url }}?{{ az_blob_token }}" --from-to LocalBlob --log-level INFO --output-type json
+        #   register: azcopy_output
+        #   failed_when: "'errorCode' in azcopy_output.stdout"
+
+        # - name: Upload size report to Azure Blob Storage
+        #   shell: |
+        #     azcopy copy "{{ base_backup_dir }}/{{ backup_folder }}-size.txt" "{{ az_blob_url }}?{{ az_blob_token }}" --from-to LocalBlob
+        #   when: size_report_file.stat.exists
+        
+        - name: Check if upload.py exists on the remote server
+          stat:
+            path: "{{ upload_script_path }}"
+          register: upload_script
+        
+        
+        - name: Upload backup to Google Drive
+          shell: "python3 /data/mongodb/upload.py {{ base_backup_dir }}/{{ backup_folder }}.tar.gz"
+          register: upload_output
+          ignore_errors: yes  # Continue even if the script fails
+
+        - name: Show Google Drive upload result
+          debug:
+            var: upload_output.stdout
+    
+        - name: Fail the playbook if the upload to Google Drive failed
+          fail:
+            msg: "Google Drive upload failed!"
+          when: upload_output is failed or (upload_output.stdout is search("error"))
+
+        - name: Remove local backup folder and size report after upload
+          file:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}"
+            state: absent
+          ignore_errors: yes
+
+        - name: Remove compressed backup file after upload
+          file:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}.tar.gz"
+            state: absent
+          ignore_errors: yes
+
+        - name: Remove size report file after upload
+          file:
+            path: "{{ base_backup_dir }}/{{ backup_folder }}-size.txt"
+            state: absent
+          ignore_errors: yes
+
+      rescue:
+        - name: Write Python script to temporary file
+          copy:
+            content: |
+              import smtplib
+              from email.mime.multipart import MIMEMultipart
+              from email.mime.text import MIMEText
+      
+              def send_email(subject, body, recipients):
+                  msg = MIMEMultipart()
+                  msg['From'] = "{{ email_sender }}"
+                  msg['Subject'] = subject
+                  recipients_list = recipients.split(",")
+                  msg['To'] = ", ".join(recipients_list)
+                  msg.attach(MIMEText(body, 'html'))
+                  try:
+                      server = smtplib.SMTP("{{ smtp_server }}", {{ smtp_port }})
+                      server.starttls()
+                      server.login("{{ smtp_username }}", "{{ smtp_password }}")
+                      server.sendmail("{{ email_sender }}", recipients_list, msg.as_string())
+                      server.quit()
+                  except Exception as e:
+                      print(f"Failed to send email: {str(e)}")
+      
+              send_email(
+                  subject="railtel-hyd-MongoDB Backup Job (Backup) - FAILED",
+                  body='<h2 style="color:red;">Job FAILED</h2><p>Job Type: Backup</p><p>Error: Playbook failed at task: {{ failed_task }} with error: {{ failed_reason }}</p>',
+                  recipients="{{ email_recipients }}"
+              )
+            dest: /tmp/send_email_failure.py
+      
+        - name: Notify failure using Python script
+          command: python3 /tmp/send_email_failure.py
+          ignore_errors: yes
+      
+        - name: Remove temporary Python script
+          file:
+            path: /tmp/send_email_failure.py
+            state: absent
+          ignore_errors: yes
+      
+      always:
+        - name: Write success notification Python script to temporary file
+          copy:
+            content: |
+              import smtplib
+              from email.mime.multipart import MIMEMultipart
+              from email.mime.text import MIMEText
+      
+              def send_email(subject, body, recipients):
+                  msg = MIMEMultipart()
+                  msg['From'] = "{{ email_sender }}"
+                  msg['Subject'] = subject
+                  recipients_list = recipients.split(",")
+                  msg['To'] = ", ".join(recipients_list)
+                  msg.attach(MIMEText(body, 'html'))
+                  try:
+                      server = smtplib.SMTP("{{ smtp_server }}", {{ smtp_port }})
+                      server.starttls()
+                      server.login("{{ smtp_username }}", "{{ smtp_password }}")
+                      server.sendmail("{{ email_sender }}", recipients_list, msg.as_string())
+                      server.quit()
+                  except Exception as e:
+                      print(f"Failed to send email: {str(e)}")
+      
+              db_size_list_html = ''
+              if "{{ db_size_list }}" and 'ansible_failed_result' not in vars():
+                  db_size_list_html = '<table border="1"><tr><th>Database Name</th><th>Size</th></tr>'
+                  for db in {{ db_size_list }}:
+                      db_size_list_html += f'<tr><td>{db.split(": ")[0]}</td><td>{db.split(": ")[1]}</td></tr>'
+                  db_size_list_html += '</table>'
+      
+              send_email(
+                  subject="railtel-hyd-MongoDB Backup Job (Backup) - SUCCESS",
+                  body=f'<h2 style="color:green;">Job SUCCESS</h2><p>Job Type: Backup</p>{db_size_list_html}',
+                  recipients="{{ email_recipients }}"
+              )
+            dest: /tmp/send_email_success.py
+      
+        - name: Notify success using Python script
+          command: python3 /tmp/send_email_success.py
+          when: ansible_failed_result is not defined
+          ignore_errors: yes
+      
+        - name: Remove temporary success notification Python script
+          file:
+            path: /tmp/send_email_success.py
+            state: absent
+          ignore_errors: yes

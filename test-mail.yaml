@@ -1,0 +1,15 @@
+---
+- name: Test Ansible mail module
+  hosts: localhost
+  tasks:
+    - name: Send test email
+      community.general.mail:
+        host: smtp.gmail.com
+        port: 587
+        username: "alerts@mobiusdtaas.ai"
+        password: "Gaian123456789"
+        to: "kota.g@mobiusdtaas.ai"
+        from: "alerts@mobiusdtaas.ai"
+        subject: "Test Ansible Mail"
+        body: "This is a test email sent via Ansible's mail module."
+        secure: starttls
