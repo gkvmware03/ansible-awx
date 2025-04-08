@@ -1,0 +1,131 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: content-backup
+  namespace: dev-mobius
+spec:
+  #schedule: "*/3 * * * *" # Runs every 3 minutes
+  schedule: "0 22 * * *" # Runs every day at 10 PM
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          annotations:
+            sidecar.istio.io/inject: "false" # Disable Istio sidecar injection
+        spec:
+          containers:
+            - name: backup
+              image: gaianmobius/awx:v0.2 # Custom image with necessary tools
+              command:
+                - "/bin/bash"
+                - "-c"
+              args:
+                - |
+                  echo "Starting backup process...";
+                  current_date=$(date +'%Y-%m-%d_%H-%M-%S');
+                  backup_file="/mnt/content-service/backup-ctrls-hyd-${current_date}.tar.gz";
+                  encrypted_file="${backup_file}.enc";
+
+                  # Ensure dependencies are installed
+                  echo "Updating package lists and installing dependencies..."
+                  apt-get update && apt-get install -y python3 python3-pip || exit 1;
+
+                  # Create tarball
+                  tar -czvf "$backup_file" -C /mnt/content-service content-service;
+                  echo "Backup compressed as $backup_file.";
+
+                  # Encrypt the tarball
+                  openssl enc -aes-256-cbc -salt -in "$backup_file" -out "$encrypted_file" -pass pass:$ENCRYPTION_PASSWORD;
+                  echo "Backup encrypted as $encrypted_file.";
+
+                  # Attempt to upload
+                  if python3 /mnt/content-service/upload.py "$encrypted_file" "$EMAIL"; then
+                    echo "Upload successful. Sending success email.";
+                    python3 -c "
+                  import os
+                  import smtplib
+                  from email.mime.text import MIMEText
+
+                  def human_readable_size(size, decimal_places=2):
+                      for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                          if size < 1024.0:
+                              return f'{size:.{decimal_places}f} {unit}'
+                          size /= 1024.0
+
+                  # Get file size in human-readable format
+                  file_size = os.path.getsize('$encrypted_file')
+                  readable_size = human_readable_size(file_size)
+
+                  # Compose email
+                  msg = MIMEText(f'Backup succeeded and has been uploaded successfully. File: $encrypted_file\\nSize: {readable_size}')
+                  msg['Subject'] = 'ctrls-hyd-content-service Backup Succeeded'
+                  msg['From'] = '$EMAIL'
+                  msg['To'] = 'devops@mobiusdtaas.ai'
+
+                  # Send email
+                  with smtplib.SMTP('$SMTP_SERVER', int($SMTP_PORT)) as server:
+                      server.starttls()
+                      server.login('$SMTP_USERNAME', '$SMTP_PASSWORD')
+                      server.sendmail(msg['From'], msg['To'], msg.as_string())
+                  "
+                    rm -f "$backup_file" "$encrypted_file";
+                  else
+                    echo "Upload failed. Sending failure email.";
+                    python3 -c "
+                  import os
+                  import smtplib
+                  from email.mime.text import MIMEText
+
+                  def human_readable_size(size, decimal_places=2):
+                      for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                          if size < 1024.0:
+                              return f'{size:.{decimal_places}f} {unit}'
+                          size /= 1024.0
+
+                  # Attempt to get file size
+                  try:
+                      file_size = os.path.getsize('$backup_file')
+                      readable_size = human_readable_size(file_size)
+                  except FileNotFoundError:
+                      readable_size = 'Unknown (file not found)'
+
+                  # Compose email
+                  msg = MIMEText(f'Backup failed or upload encountered an error. File: $backup_file or $encrypted_file\\nLast known size: {readable_size}')
+                  msg['Subject'] = 'ctrls-hyd-content-service Backup Failed'
+                  msg['From'] = '$EMAIL'
+                  msg['To'] = 'devops@mobiusdtaas.ai'
+
+                  # Send email
+                  with smtplib.SMTP('$SMTP_SERVER', int($SMTP_PORT)) as server:
+                      server.starttls()
+                      server.login('$SMTP_USERNAME', '$SMTP_PASSWORD')
+                      server.sendmail(msg['From'], msg['To'], msg.as_string())
+                  "
+                    rm -f "$backup_file" "$encrypted_file";
+                    exit 1;
+                  fi;
+
+              env:
+                - name: ENCRYPTION_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: content-backup-secret
+                      key: encryption-password
+                - name: EMAIL
+                  value: "alerts@mobiusdtaas.ai"
+                - name: SMTP_SERVER
+                  value: "smtp.gmail.com" # Replace with your SMTP server
+                - name: SMTP_PORT
+                  value: "587" # Replace with your SMTP port
+                - name: SMTP_USERNAME
+                  value: "alerts@mobiusdtaas.ai" # Replace with your SMTP username
+                - name: SMTP_PASSWORD
+                  value: "Gaian123456789" # Replace with your SMTP password
+              volumeMounts:
+                - mountPath: /mnt/content-service
+                  name: longhorn-dev-mobius-pvc
+          volumes:
+            - name: longhorn-dev-mobius-pvc
+              persistentVolumeClaim:
+                claimName: longhorn-dev-mobius-pvc
+          restartPolicy: Never
